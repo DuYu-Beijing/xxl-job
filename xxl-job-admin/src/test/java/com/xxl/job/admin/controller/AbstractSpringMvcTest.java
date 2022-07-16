@@ -16,6 +16,7 @@ public class AbstractSpringMvcTest {
 
   @BeforeEach
   public void setup() {
+
     this.mockMvc = MockMvcBuilders.webAppContextSetup(this.applicationContext).build();
   }
 
