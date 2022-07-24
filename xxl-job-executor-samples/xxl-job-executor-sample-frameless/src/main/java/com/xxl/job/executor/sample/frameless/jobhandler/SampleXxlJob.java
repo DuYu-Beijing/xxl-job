@@ -1,6 +1,7 @@
 package com.xxl.job.executor.sample.frameless.jobhandler;
 
 import com.xxl.job.core.context.XxlJobHelper;
+import com.xxl.job.core.handler.IJobHandler;
 import com.xxl.job.core.handler.annotation.XxlJob;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
