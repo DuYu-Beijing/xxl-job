@@ -1,0 +1,108 @@
+XXL-Job源码阅读
+一、阅读备注
+0、读README.md没啥用，要读XXL-JOB官方文档.md，先让服务跑起来瞧瞧。
+
+1、com.xxl.job.admin.service.XxlJobService 任务的增删改查
+备注：增加任务接口里面有很多校验逻辑
+
+2、com.xxl.job.admin.service.LoginService 登录校验
+有数据库表存储注册过的信息
+
+3、com.xxl.job.admin.controller 此路径下有很多controller，涉及注册登录、服务注册和自动发现、任务添加和编辑、日志
+
+4、核心类：com.xxl.job.core.executor.XxlJobExecutor
+
+5、无框架调用的流程
+服务器：
+启动类加载，扫描包，加载com.xxl.job.admin.core.conf.XxlJobAdminConfig
+	配置类继承InitializingBean，属性填充后，调用 afterPropertiesSet() 函数，初始化 xxlJobScheduler
+		com.xxl.job.admin.core.scheduler.XxlJobScheduler#init
+		触发池（快、慢）开启
+		注册观察线程开启
+		注册失败观察线程开启
+		任务完成线程开启
+		日志线程开启
+		定时任务执行线程开启 com.xxl.job.admin.core.thread.JobScheduleHelper#start
+
+
+com.xxl.job.admin.core.thread.JobScheduleHelper 开启线程，从表中获取数据并执行Job，有预先读5秒，间隔小于5秒的设置闹钟
+	com.xxl.job.admin.core.thread.JobTriggerPoolHelper#addTrigger 使用线程池，异步将执行的任务放到队列
+	com.xxl.job.admin.core.thread.JobTriggerPoolHelper#trigger触发执行Job
+		com.xxl.job.admin.core.trigger.XxlJobTrigger#trigger设置必要信息
+		com.xxl.job.admin.core.trigger.XxlJobTrigger#processTrigger 判断是否分片，调用任务，记录日志
+		com.xxl.job.admin.core.trigger.XxlJobTrigger#runExecutor
+			com.xxl.job.core.biz.client.ExecutorBizClient#run 调用netty方法远程访问
+			com.xxl.job.core.server.EmbedServer.EmbedHttpServerHandler#channelRead0 http请求处理类
+			com.xxl.job.core.biz.impl.ExecutorBizImpl#run 执行远程调用job，反射出IJobHandler实例
+			com.xxl.job.core.executor.XxlJobExecutor#registJobThread 创建并开启Job线程，处理队列中的改类任务的Item	
+				com.xxl.job.core.thread.JobThread#run 守护线程执行 triggerQueue中的任务，反射执行方法
+				com.xxl.job.core.handler.IJobHandler#execute 最终通过反射执行目标方法
+			将开始反射出IJobHandler实例，放入 triggerQueue 队列中
+	下次触发时间小于5秒，放入定时器线程中触发，不再读DB
+	启动定时器线程，处理间隔时间短的任务
+	
+
+
+客户端提交注册Job的main函数
+	com.xxl.job.executor.sample.frameless.config.FrameLessXxlJobConfig#initXxlJobExecutor 初始化接入方信息
+		com.xxl.job.core.executor.impl.XxlJobSimpleExecutor#start 初始化JobHandler方法仓库
+			根据注解 @XXLJob 注解来注册JobHandler
+		com.xxl.job.core.executor.XxlJobExecutor#start
+			初始化日志路径
+			初始化注册中心的列表，将接入地址和token传入
+			初始化日志文件清理时长
+			回调线程启动
+			启动一个NIO服务EmbedServer（Netty）
+				com.xxl.job.core.server.EmbedServer 开启守护线程，注册app
+					com.xxl.job.core.thread.ExecutorRegistryThread#start 开启注册守护线程，每30秒注册一次
+						com.xxl.job.core.biz.client.AdminBizClient#registry 注册客户端发送HTTP请求到中心服务
+						服务端处理rest请求：
+						com.xxl.job.admin.controller.JobApiController#api 接收处理请求
+							com.xxl.job.admin.core.thread.JobRegistryHelper#registry 使用线程池异步处理请求
+								保存到数据库，刷新注册信息
+
+
+6、Spring启动入口：
+启动类扫描并实例化Bean时，com.xxl.job.executor.core.config.XxlJobConfig#xxlJobExecutor，配置文件中的Bean对象xxlJobExecutor被实例化
+com.xxl.job.core.executor.impl.XxlJobSpringExecutor
+	XxlJobSpringExecutor 继承了 ApplicationContextAware，会在Bean实例化后调用aware
+	初始化基于方法拦截的仓库
+		通过查找 @XxlJob的注解，拉取被调用的方法列表
+		注册jobHandlercom.xxl.job.core.executor.XxlJobExecutor#registJobHandler
+		通过反射，将job执行方法放入 jobHandlerRepository仓库中
+	初始化反射job实例的模式
+	com.xxl.job.core.executor.XxlJobExecutor#start 和客户端一样的job执行器启动初始化
+	
+	
+	
+二、问题：
+1、单元测试用例看起来是h2的，怎么会实际连我们本地数据库呢？com.xxl.job.admin.controller.JobInfoControllerTest
+--->不是H2的数据库，是链接实际数据库的。目前的启动类是AbstractSpringMVCTest，上面注解是 @SpringBootTest，是实际数据库连接
+2、单元测试用例怎样运行起来呢？
+--->在数据库建立表之后，可以运行起来
+3、向中心注册Handler时，会把handler的类或方法字节码传到注册中心么？不然怎么反射出类，反射执行方法呢？
+远程调用服务倒是可行，RPC接口，知道地址，直接执行
+--->调度器是本地的，中心只负责调度，收集日志
+4、com.xxl.job.executor.sample.frameless.config.FrameLessXxlJobConfig#initXxlJobExecutor 这个简单调用，实际部署服务后，通过RPC调用吧？
+5、job执行回调，是/run的http接口，不是函数方法？
+	是开启了netty服务，并加载了接口么？等/run调用netty接口时，就执行该函数？说明netty也有jvm么？
+	---> 中心分机思想，执行/run是分机（客户端）向注册中心发送请求，注册中心通过EmbedHttpServerHandler类处理http请求，执行ExecutorBizImpl里run方法，反射实现函数调用
+6、
+
+
+三、观看其他组员学习历程有感
+1、更新数据库的写法，现update后save
+2、方法入参增加传入自定义的默认值，也有优势
+3、线程池参数选定，各参数意义，拒绝策略，JDK的源码
+4、分布式锁的方式，优缺点
+5、aware的种类和用法，spring源码
+6、路由，多服务启动
+7、饿汉模式：使用之前，就已经new好了这个类
+懒汉模式：--
+8、守护线程和普通线程的区别？
+9、调度 -- 执行器执行 -- 是否成功失败 -- 异步通知调度 -- 调度重复或者超时处理
+10、日志写入队列的目的？量大？批量？阻塞耗时？
+
+
+
+
