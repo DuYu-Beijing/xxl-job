@@ -12,8 +12,8 @@ XXL-Job源码阅读
 
 4、核心类：com.xxl.job.core.executor.XxlJobExecutor
 
-5、无框架调用的流程
-服务器：
+5、服务器启动 + 无框架调用的流程
+服务器启动：
 启动类加载，扫描包，加载com.xxl.job.admin.core.conf.XxlJobAdminConfig
 	配置类继承InitializingBean，属性填充后，调用 afterPropertiesSet() 函数，初始化 xxlJobScheduler
 		com.xxl.job.admin.core.scheduler.XxlJobScheduler#init
@@ -31,8 +31,6 @@ com.xxl.job.admin.core.thread.JobScheduleHelper 开启线程，从表中获取�
 		com.xxl.job.admin.core.trigger.XxlJobTrigger#trigger设置必要信息
 		com.xxl.job.admin.core.trigger.XxlJobTrigger#processTrigger 判断是否分片，调用任务，记录日志
 		com.xxl.job.admin.core.trigger.XxlJobTrigger#runExecutor
-			com.xxl.job.core.biz.client.ExecutorBizClient#run 调用netty方法远程访问
-			com.xxl.job.core.server.EmbedServer.EmbedHttpServerHandler#channelRead0 http请求处理类
 			com.xxl.job.core.biz.impl.ExecutorBizImpl#run 执行远程调用job，反射出IJobHandler实例
 			com.xxl.job.core.executor.XxlJobExecutor#registJobThread 创建并开启Job线程，处理队列中的改类任务的Item	
 				com.xxl.job.core.thread.JobThread#run 守护线程执行 triggerQueue中的任务，反射执行方法
@@ -87,7 +85,6 @@ com.xxl.job.core.executor.impl.XxlJobSpringExecutor
 5、job执行回调，是/run的http接口，不是函数方法？
 	是开启了netty服务，并加载了接口么？等/run调用netty接口时，就执行该函数？说明netty也有jvm么？
 	---> 中心分机思想，执行/run是分机（客户端）向注册中心发送请求，注册中心通过EmbedHttpServerHandler类处理http请求，执行ExecutorBizImpl里run方法，反射实现函数调用
-6、
 
 
 三、观看其他组员学习历程有感
@@ -104,5 +101,97 @@ com.xxl.job.core.executor.impl.XxlJobSpringExecutor
 10、日志写入队列的目的？量大？批量？阻塞耗时？
 
 
+四、细读
+1、无框架执行器启动注册Job
+初始化配置信息
+初始化JobHandler仓库，将注解标识的Job方法放到jobHandlerRepository
+	初始化日志路径
+		默认/data/applogs/xxl-job/jobhandler路径
+		自定义的路径没校验并创建
+	初始化执行器，负责本地回调、注册、注销
+		通过注册地址，可以配置多个
+	日志文件滚动
+		开启守护线程，根据配置的保留天数，递归删除逾期日志文件
+		线程休眠一天
+	初始化回调线程
+		启动守护线程，处理回调队列里面信息
+			com.xxl.job.core.thread.TriggerCallbackThread#doCallback
+				执行器发送http请求到Netty
+				注册中心处理http请求
+					com.xxl.job.admin.core.thread.JobCompleteHelper#callback()
+						回调线程池执行com.xxl.job.admin.core.thread.JobCompleteHelper#callback()
+				toStop暂停线程时，最后一次日志也会执行
+				打印callbackLog，日志在执行器本地
+				如果http请求无响应，回调任务被写入重试文件中
+		启动守护线程，处理重试回调任务
+	初始化Netty服务		
+		启动守护线程，绑定端口和地址，启动Netty服务
+			创建执行器线程池
+			创建Netty服务，wait util stop
+			中间调用注册执行器
+				com.xxl.job.core.thread.ExecutorRegistryThread#start启动注册循环线程，循环间隔为心跳30秒
+					执行器发送注册http请求
+					注册中心处理http请求，异步将注册信息更新到表里 xxl_job_registry
+				线程中，循环注册结束后，调用注销接口
+					执行器发送注册http请求
+					注册中心处理http请求，异步将注销信息更新到表里 xxl_job_registry，使用delete直接删除的
+				
+2、注册中心启动
+com.xxl.job.admin.core.conf.XxlJobAdminConfig#afterPropertiesSet 实例化初始化后被调用
+	com.xxl.job.admin.core.scheduler.XxlJobScheduler#init 初始化Job规划器
+		1、国际化信息配置
+			Spring加载初始化 com.xxl.job.admin.core.conf.XxlJobAdminConfig#i18n 值为简体中文
+			message_zh_CN.properties 加载配置此文件的属性
+			修改本地阻塞枚举值枚举值ExecutorBlockStrategyEnum为单机串行、丢弃后续调度、覆盖之前调度
+		2、注册中心触发器线程池开启
+			初始化快慢两个线程池，用来触发job
+		3、job注册开启
+			初始化注册或注销线程池
+			开启注册监听线程，守护线程，心跳30秒一循环
+				获取自动注册的job组，xxl_job_group
+				清理心跳结束的注册，xxl_job_registry，连续>3个心跳周期丢失
+				刷新心跳周期在3个内的状态
+					获取注册地址
+				将注册地址更新到job组属性中，就是将 xxl_job_registry 地址同步到 xxl_job_group，因为注册表会有心跳注册一直更新
+		4、job失败监听开启
+			开启监听守护线程，10秒循环一次
+				从表 xxl_job_log 中查询失败日志
+				锁定日志
+				重试触发，并更新日志表
+				告警，发送邮件，修改表xxl_job_log中的告警状态
+		5、job完成开启
+			初始化回调线程池
+			Job丢失监控线程开启，守护线程，60秒一循环
+				从日志表中查找更新时间超过10分钟，运行中的日志
+					结束job，com.xxl.job.admin.core.complete.XxlJobCompleter#finishJob
+						如果调度成功，则直接触发其子job
+					更新日志信息
+		6、job日志报告开启
+			开启守护线程，循环时间1分钟
+				最近三天日志表中的每天日志量，调度总量，调度成功量
+				更新到xxl_job_log_report 报告表中
+				查询过期日志，天数是执行器传过来的参数
+				将日志删除
+		7、job循环调度开启
+
+3、路由策略
+	com.xxl.job.admin.core.route.ExecutorRouter的子类，策略模式
+4、日志队列
+	XxlJobAdminConfig.getAdminConfig().getXxlJobLogDao().updateTriggerInfo(jobLog);没有队列呀？？？
+5、实现单机串行
+	JobScheduleHelper 循环查阅待执行的jobInfo时，使用DB的分布式锁
+	每次只会有一个注册中心实例拿到DB锁，该实例会扫描表中所有待执行的job信息
+
+五、疑问
+1、回调执行callBack函数，com.xxl.job.admin.core.thread.JobCompleteHelper#callback()，是注册中心执行还是执行器执行？xxl_job_log表
+---> 注册中心执行，AdminBizClient 与 ExecutorBizClient 的区别解释了这个。
+2、清理死亡注册job后，还要刷新？不是已经被清理了么？JobRegistryHelper
+---> 小于死亡时间段的输入死亡job，大于死亡时间段小于当前的是存活线程
 
 
+六、交流分享
+1、hash强一致性
+2、用户设置加权，如何实现加权轮询
+3、通过LinkedHashMap实现常用的和不常用的元素排序与获取
+看一下使用频率最大和最小，他们实现不一样的
+4、
